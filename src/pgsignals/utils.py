@@ -1,10 +1,11 @@
 import enum
+import dataclasses
 import functools
 import select
 import json
 import logging
 
-from typing import Sequence
+from typing import Sequence, Dict, Any
 from django.apps import apps
 from django.db import connections
 from django.conf import settings
@@ -52,12 +53,37 @@ class EventKind(enum.Enum):
     UPDATE = 'UPDATE'
     DELETE = 'DELETE'
 
+    @property
+    def is_create(self) -> bool:
+        return self is self.INSERT
+
+    @property
+    def is_update(self) -> bool:
+        return self is self.UPDATE
+
+    @property
+    def is_save(self) -> bool:
+        return self.is_create or self.is_update
+
+    @property
+    def is_delete(self) -> bool:
+        return self is self.DELETE
+
 
 ALL_EVENTS = (
     EventKind.INSERT,
     EventKind.UPDATE,
     EventKind.DELETE
 )
+
+
+@dataclasses.dataclass
+def Event:
+    txid: int
+    operation: EventKind
+    table: str
+    row_before: Dict[str, Any]
+    row_after: Dict[str, Any]
 
 
 def listen(db=DEFAULT_DATABASE, schema=DEFAULT_SCHEMA) -> None:
@@ -77,16 +103,18 @@ def listen(db=DEFAULT_DATABASE, schema=DEFAULT_SCHEMA) -> None:
 
         for notify in iter_notifies():
             try:
-                event = json.loads(notify.payload)
+                _notify = json.loads(notify.payload)
+                _notify["operation"] = EventKind(_notify["operation"])
             except json.JSONDecodeError as e:
                 log.error(e)
             else:
-                sender = _table_to_model(event['table'])
+                event = Event(**_notify)
+                sender = _table_to_model(event.table)
                 pgsignals_event.send(sender=sender, event=event)
 
                 if is_info:
-                    log.info(f"Emit signal for {event['table']}, "
-                             f"action {event['operation']},"
+                    log.info(f"Emit signal for {event.table}, "
+                             f"action {event.operation.name},"
                              f"sender {sender}")
 
 
