@@ -1,5 +1,6 @@
 import enum
 import dataclasses
+import datetime
 import functools
 import select
 import json
@@ -10,6 +11,18 @@ from django.apps import apps
 from django.db import connections
 from django.conf import settings
 
+
+__all__ = (
+    "Event",
+    "EventKind",
+    "listen",
+    "bind_model",
+    "unbind_model",
+    "bind_table",
+    "unbind_table",
+    "create_emit_func",
+    "create_emit_func_once",
+)
 
 log = logging.getLogger(__name__)
 is_info = log.isEnabledFor(logging.INFO)
@@ -78,7 +91,7 @@ ALL_EVENTS = (
 
 
 @dataclasses.dataclass
-def Event:
+class Event:
     txid: int
     operation: EventKind
     table: str
@@ -86,20 +99,31 @@ def Event:
     row_after: Dict[str, Any]
 
 
-def listen(db=DEFAULT_DATABASE, schema=DEFAULT_SCHEMA) -> None:
-    from .signals import pgsignals_event
+_now = datetime.datetime.now
+
+
+def listen(
+        db=DEFAULT_DATABASE,
+        schema=DEFAULT_SCHEMA,
+        poll_secs=5, stop_secs=None) -> None:
+
+    from . import signals
 
     with connections[db].cursor() as cursor:
         conn = cursor.connection
         cursor.execute(f'LISTEN {PREFIX}__events;')
+        started_at = _now()
 
         def iter_notifies():
-            wait_secs = 5
             while True:
-                if any(select.select([conn],[],[], wait_secs)):
+                if stop_secs:
+                    if (_now() - started_at).seconds >= stop_secs:
+                        return
+                if any(select.select([conn],[],[], poll_secs)):
                     conn.poll()
                     while conn.notifies:
                         yield conn.notifies.pop()
+
 
         for notify in iter_notifies():
             try:
@@ -110,7 +134,24 @@ def listen(db=DEFAULT_DATABASE, schema=DEFAULT_SCHEMA) -> None:
             else:
                 event = Event(**_notify)
                 sender = _table_to_model(event.table)
-                pgsignals_event.send(sender=sender, event=event)
+                signals.pgsignals_event.send(
+                    sender=sender, event=event)
+
+                if event.operation.is_create:
+                    signals.pgsignals_insert_event.send(
+                        sender=sender, event=event)
+
+                if event.operation.is_save:
+                    signals.pgsignals_insert_or_update_event.send(
+                        sender=sender, event=event)
+
+                elif event.operation.is_update:
+                    signals.pgsignals_update_event.send(
+                        sender=sender, event=event)
+
+                elif event.operation.is_delete:
+                    signals.pgsignals_delete_event.send(
+                        sender=sender, event=event)
 
                 if is_info:
                     log.info(f"Emit signal for {event.table}, "

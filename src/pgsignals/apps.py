@@ -6,6 +6,11 @@ from django.db.models.signals import post_migrate
 from appconf import AppConf
 
 
+__all__ = (
+    "PgsignalsConf",
+    "PgsignalsConfig",
+)
+
 log = logging.getLogger(__name__)
 is_info = log.isEnabledFor(logging.INFO)
 
