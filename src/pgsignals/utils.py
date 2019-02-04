@@ -32,19 +32,31 @@ PREFIX = settings.PGSIGNALS_PREFIX
 DEFAULT_SCHEMA = settings.PGSIGNALS_DEFAULT_SCHEMA
 DEFAULT_DATABASE = settings.PGSIGNALS_DEFAULT_DATABASE
 
+
+CREATE_STAGING_TABLE = """
+    CREATE TABLE "{schema}"."{prefix}__events" IF NOT EXISTS (
+        ts TIMESTAMPTZ DEFAULT now(),
+        payload JSONB
+    );
+"""
+
 CREATE_EMIT_FUNC = """
     CREATE OR REPLACE FUNCTION "{schema}"."{prefix}__emit_event"()
     RETURNS trigger AS $$
+    DECLARE
+        payload jsonb;
     BEGIN
-        PERFORM pg_notify(
-            '{prefix}__events',
-            json_build_object(
-                'txid', txid_current(),
-                'operation', TG_OP,
-                'table', TG_TABLE_NAME,
-                'row_before', row_to_json(OLD),
-                'row_after', row_to_json(NEW))::text
-        );
+        payload := json_build_object(
+            'txid', txid_current(),
+            'operation', TG_OP,
+            'table', TG_TABLE_NAME,
+            'row_before', row_to_json(OLD),
+            'row_after', row_to_json(NEW));
+        INSERT INTO "{schema}"."{prefix}__events" (ts, payload)
+        VALUES (now(), payload);
+
+        PERFORM pg_notify('{prefix}__events', '');
+
         RETURN NEW;
     END;
     $$ LANGUAGE plpgsql;
@@ -105,7 +117,18 @@ _now = datetime.datetime.now
 def listen(
         db=DEFAULT_DATABASE,
         schema=DEFAULT_SCHEMA,
-        poll_secs=5, stop_secs=None) -> None:
+        poll_timeout=5,
+        listen_timeout=None,
+        events_limit=None) -> None:
+    """
+    Listen database events
+
+    :param db: Database name
+    :param schema: Schema name in database
+    :param poll_timeout: Max wait timeout for polling (in seconds)
+    :param listen_timeout: Max listen timeout (in seconds)
+    :param events_limit: Max events count to listen
+    """
 
     from . import signals
 
@@ -119,7 +142,7 @@ def listen(
                 if stop_secs:
                     if (_now() - started_at).seconds >= stop_secs:
                         return
-                if any(select.select([conn],[],[], poll_secs)):
+                if any(select.select([conn],[],[], poll_timeout)):
                     conn.poll()
                     while conn.notifies:
                         yield conn.notifies.pop()
