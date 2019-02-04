@@ -1,162 +1,162 @@
-import enum
-import dataclasses
-import datetime
 import functools
-import select
-import json
+import itertools
 import logging
+import select
+import time
 
-from typing import Sequence, Dict, Any
 from django.apps import apps
-from django.db import connections
 from django.conf import settings
+from django.db import connections
+from typing import Sequence, Optional, Iterable, Dict
+
+from .event import Event
+from .enums import EventKind, ALL_EVENTS
+from .sql import *
 
 
 __all__ = (
-    "Event",
-    "EventKind",
     "listen",
+    "iter_notifies",
+    "emit_event",
     "bind_model",
     "unbind_model",
     "bind_table",
     "unbind_table",
-    "create_emit_func",
-    "create_emit_func_once",
 )
+
 
 log = logging.getLogger(__name__)
 is_info = log.isEnabledFor(logging.INFO)
 
-
 PREFIX = settings.PGSIGNALS_PREFIX
 DEFAULT_SCHEMA = settings.PGSIGNALS_DEFAULT_SCHEMA
 DEFAULT_DATABASE = settings.PGSIGNALS_DEFAULT_DATABASE
-
-CREATE_EMIT_FUNC = """
-    CREATE OR REPLACE FUNCTION "{schema}"."{prefix}__emit_event"()
-    RETURNS trigger AS $$
-    BEGIN
-        PERFORM pg_notify(
-            '{prefix}__events',
-            json_build_object(
-                'txid', txid_current(),
-                'operation', TG_OP,
-                'table', TG_TABLE_NAME,
-                'row_before', row_to_json(OLD),
-                'row_after', row_to_json(NEW))::text
-        );
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-"""
-
-DROP_TRIGGER = """
-    DROP TRIGGER IF EXISTS "{prefix}__{table}" ON "{schema}"."{table}";
-"""
-
-CREATE_TRIGGER = """
-    CREATE TRIGGER "{prefix}__{table}" AFTER {operations}
-    ON "{schema}"."{table}" FOR EACH ROW
-    EXECUTE PROCEDURE "{schema}"."{prefix}__emit_event"();
-"""
-
-
-class EventKind(enum.Enum):
-    INSERT = 'INSERT'
-    UPDATE = 'UPDATE'
-    DELETE = 'DELETE'
-
-    @property
-    def is_create(self) -> bool:
-        return self is self.INSERT
-
-    @property
-    def is_update(self) -> bool:
-        return self is self.UPDATE
-
-    @property
-    def is_save(self) -> bool:
-        return self.is_create or self.is_update
-
-    @property
-    def is_delete(self) -> bool:
-        return self is self.DELETE
-
-
-ALL_EVENTS = (
-    EventKind.INSERT,
-    EventKind.UPDATE,
-    EventKind.DELETE
-)
-
-
-@dataclasses.dataclass
-class Event:
-    txid: int
-    operation: EventKind
-    table: str
-    row_before: Dict[str, Any]
-    row_after: Dict[str, Any]
-
-
-_now = datetime.datetime.now
+DEFAULT_POLL_TIMEOUT = settings.PGSIGNALS_POLL_TIMEOUT
 
 
 def listen(
-        db=DEFAULT_DATABASE,
-        schema=DEFAULT_SCHEMA,
-        poll_secs=5, stop_secs=None) -> None:
+        db: str = DEFAULT_DATABASE,
+        schema: str = DEFAULT_SCHEMA,
+        poll_timeout: int = DEFAULT_POLL_TIMEOUT,
+        listen_timeout: Optional[int] = None,
+        events_limit: Optional[int] = None,
+        once: bool = False) -> None:
+    """
+    Listen database events
 
-    from . import signals
+    :param db: Database name
+    :param schema: Schema name in database
+    :param poll_timeout: Max wait timeout for polling (in seconds)
+    :param listen_timeout: Max listen timeout (in seconds)
+    :param events_limit: Max events count to listen
+    :param once: Handle only first batch of events 
+    """
+    notifies = iter_notifies(
+        db=db,
+        schema=schema,
+        poll_timeout=poll_timeout,
+        iter_timeout=listen_timeout,
+        once=once)
+
+    if events_limit is not None:
+        notifies = itertools.islice(notifies, 0, events_limit)
+
+    for notify in notifies:
+        emit_event(notify)
+
+
+def iter_notifies(
+        db: str = DEFAULT_DATABASE,
+        schema: str = DEFAULT_SCHEMA,
+        poll_timeout: int = DEFAULT_POLL_TIMEOUT,
+        iter_timeout: Optional[int] = None,
+        once: bool = False) -> Iterable[Event]:
+    """
+    Create iterator over database events/notifies
+
+    :param db: Database name
+    :param schema: Schema name in database
+    :param poll_timeout: Max wait timeout for polling (in seconds)
+    :param iter_timeout: Max lifetime for iterator (in seconds)
+    :param once: If True, then iterator will be stopped after first iteration
+    """
+    started_at = time.time()
 
     with connections[db].cursor() as cursor:
+
+        # Iterator for extracting events from staging table
+        def _iter_events():
+            cursor.execute(POP_EVENT.format(
+                schema=schema,
+                prefix=PREFIX
+            ))
+
+            for (notify,) in cursor:
+                event = _notify_to_event(notify)
+                if event is not None:
+                    yield event
+        
+        # Emit previously unhandled events
+        for event in _iter_events():
+            yield event
+
+        # Subscribe to notifications
         conn = cursor.connection
         cursor.execute(f'LISTEN {PREFIX}__events;')
-        started_at = _now()
 
-        def iter_notifies():
-            while True:
-                if stop_secs:
-                    if (_now() - started_at).seconds >= stop_secs:
-                        return
-                if any(select.select([conn],[],[], poll_secs)):
-                    conn.poll()
-                    while conn.notifies:
-                        yield conn.notifies.pop()
+        while True:
+            # Check iteration break timeout
+            if iter_timeout and (time.time() - started_at) >= iter_timeout:
+                break
+            
+            # Poll for any new notifies
+            if any(select.select([conn],[],[], poll_timeout)):
+                conn.poll()
+
+                if len(conn.notifies) > 0:
+                    conn.notifies.clear()
+                    
+                    # Emit new events
+                    for event in _iter_events():
+                        yield event
+
+            # Handle only first iteration
+            if once:
+                break
 
 
-        for notify in iter_notifies():
-            try:
-                _notify = json.loads(notify.payload)
-                _notify["operation"] = EventKind(_notify["operation"])
-            except json.JSONDecodeError as e:
-                log.error(e)
-            else:
-                event = Event(**_notify)
-                sender = _table_to_model(event.table)
-                signals.pgsignals_event.send(
-                    sender=sender, event=event)
+def emit_event(event: Event) -> None:
+    """
+    Emits Django signal
 
-                if event.operation.is_create:
-                    signals.pgsignals_insert_event.send(
-                        sender=sender, event=event)
+    :param event: Database event
+    """
+    from . import signals
 
-                if event.operation.is_save:
-                    signals.pgsignals_insert_or_update_event.send(
-                        sender=sender, event=event)
+    sender = _table_to_model(event.table)
+    signals.pgsignals_event.send(
+        sender=sender, event=event)
 
-                elif event.operation.is_update:
-                    signals.pgsignals_update_event.send(
-                        sender=sender, event=event)
+    if event.operation.is_create:
+        signals.pgsignals_insert_event.send(
+            sender=sender, event=event)
 
-                elif event.operation.is_delete:
-                    signals.pgsignals_delete_event.send(
-                        sender=sender, event=event)
+    if event.operation.is_save:
+        signals.pgsignals_insert_or_update_event.send(
+            sender=sender, event=event)
 
-                if is_info:
-                    log.info(f"Emit signal for {event.table}, "
-                             f"action {event.operation.name},"
-                             f"sender {sender}")
+    elif event.operation.is_update:
+        signals.pgsignals_update_event.send(
+            sender=sender, event=event)
+
+    elif event.operation.is_delete:
+        signals.pgsignals_delete_event.send(
+            sender=sender, event=event)
+
+    if is_info:
+        log.info(f"Emit signal for {event.table}, "
+                 f"action {event.operation.name},"
+                 f"sender {sender}")
 
 
 def bind_model(
@@ -164,6 +164,14 @@ def bind_model(
         events: Sequence[EventKind] = ALL_EVENTS,
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
+    """
+    Bind model for listening
+
+    :param django_model: Model class
+    :param events: Specifies which events to listen
+    :param db: Database name
+    :param schema: Schema name in database
+    """
     return bind_table(django_model.objects.model._meta.db_table, events)
 
 
@@ -171,7 +179,13 @@ def unbind_model(
         django_model,
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
+    """
+    Unbind model from listening
 
+    :param django_model: Model class
+    :param db: Database name
+    :param schema: Schema name in database
+    """
     return unbind_table(django_model.objects.model._meta.db_table)
 
 
@@ -180,10 +194,17 @@ def bind_table(
         events: Sequence[EventKind] = ALL_EVENTS,
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
+    """
+    Bind table for listening
 
+    :param table_name: Table name in database
+    :param events: Specifies which events to listen
+    :param db: Database name
+    :param schema: Schema name in database
+    """
     unbind_table(table_name, db=db, schema=schema)
     if len(events) > 0:
-        create_emit_func_once(db, schema)
+        migrate_pgsignals_once(db, schema)
         operations = ' OR '.join(ev.value for ev in events)
         sql = CREATE_TRIGGER.format(
             prefix=PREFIX,
@@ -202,7 +223,13 @@ def unbind_table(
         table_name: str,
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
+    """
+    Unbind table from listening
 
+    :param table_name: Table name in database
+    :param db: Database name
+    :param schema: Schema name in database
+    """
     sql = DROP_TRIGGER.format(
         prefix=PREFIX,
         schema=schema,
@@ -214,19 +241,27 @@ def unbind_table(
         log.info(f"Mute table {table_name}")
 
 
-_func_created: bool = False
-def create_emit_func_once(
+__migrated: bool = False
+def migrate_pgsignals_once(
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
-    global _func_created
-    if not _func_created:
-        create_emit_func(db, schema)
-        _func_created = True
+    
+    global __migrated
+
+    if not __migrated:
+        migrate_pgsignals(db, schema)
+        __migrated = True
 
 
-def create_emit_func(
+def migrate_pgsignals(
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
+
+    sql = CREATE_STAGING_TABLE.format(
+        prefix=PREFIX,
+        schema=schema)
+
+    _execute_sql(sql, db=db)
 
     sql = CREATE_EMIT_FUNC.format(
         prefix=PREFIX,
@@ -235,7 +270,7 @@ def create_emit_func(
     _execute_sql(sql, db=db)
 
     if is_info:
-        log.info("Create base trigger function")
+        log.info("Create staging table and the trigger function")
 
 
 def _execute_sql(sql: str, db: str) -> None:
@@ -245,8 +280,15 @@ def _execute_sql(sql: str, db: str) -> None:
 
 @functools.lru_cache()
 def _table_to_model(table_name: str):
-    for model in apps.get_models():
+    for model in apps.get_models(include_auto_created=True):
         if model._meta.db_table == table_name:
             return model
     log.error(f"Cannot found model for table {table_name}")
     return None
+
+
+def _notify_to_event(notify: Dict) -> Event:
+    return Event(**{
+        **notify,
+        "operation": EventKind(notify["operation"])
+    })
