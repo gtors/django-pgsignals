@@ -29,6 +29,9 @@ class PgsignalsConf(AppConf):
     DEFAULT_DATABASE = 'default'
     DEFAULT_SCHEMA = 'public'
 
+    # Timeout in secs for polling connection about new notifies
+    POLL_TIMEOUT = 5
+
     # Example:
     # [
     #   'app.ModelNameA',
