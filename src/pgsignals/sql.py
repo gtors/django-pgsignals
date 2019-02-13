@@ -27,24 +27,24 @@ CREATE_EMIT_FUNC = """
     RETURNS trigger AS $$
     DECLARE
         payload jsonb;
-        oldx record := null;
-        newx record := null;
+        oldx jsonb := null;
+        newx jsonb := null;
     BEGIN
         IF (TG_OP = 'DELETE') THEN
-            oldx := OLD;
+            oldx := to_jsonb(OLD);
         ELSIF (TG_OP = 'INSERT') THEN
-            newx := NEW;
+            newx := to_jsonb(NEW);
         ELSIF (TG_OP = 'UPDATE') THEN
-            oldx := OLD;
-            newx := NEW;
+            oldx := to_jsonb(OLD);
+            newx := to_jsonb(NEW);
         END IF;
 
-        payload := json_build_object(
+        payload := jsonb_build_object(
             'txid', txid_current(),
             'operation', TG_OP,
             'table', TG_TABLE_NAME,
-            'row_before', row_to_json(oldx),
-            'row_after', row_to_json(newx));
+            'row_before', oldx,
+            'row_after', newx);
         INSERT INTO "{schema}"."{prefix}__events" (ts, payload)
         VALUES (now(), payload);
 
