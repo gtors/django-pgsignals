@@ -145,11 +145,11 @@ def emit_event(event: Event) -> None:
         signals.pgsignals_insert_or_update_event.send(
             sender=sender, event=event)
 
-    elif event.operation.is_update:
+    if event.operation.is_update:
         signals.pgsignals_update_event.send(
             sender=sender, event=event)
 
-    elif event.operation.is_delete:
+    if event.operation.is_delete:
         signals.pgsignals_delete_event.send(
             sender=sender, event=event)
 
