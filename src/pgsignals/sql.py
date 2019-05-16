@@ -1,6 +1,7 @@
 __all__ = (
     "CREATE_STAGING_TABLE",
-    "POP_EVENT",
+    "POP_100_EVENTS",
+    "COUNT_EVENTS",
     "CREATE_EMIT_FUNC",
     "DROP_TRIGGER",
     "CREATE_TRIGGER",
@@ -14,11 +15,22 @@ CREATE_STAGING_TABLE = """
     );
 """
 
+COUNT_EVENTS = """
+    SELECT COUNT(*) FROM "{schema}"."{prefix}__events";
+"""
 
-POP_EVENT = """
-    DELETE FROM "{schema}"."{prefix}__events"
-    WHERE ts = (SELECT MAX(ts) FROM "{schema}"."{prefix}__events")
-    RETURNING payload;
+POP_100_EVENTS = """
+    WITH popped AS (
+        DELETE FROM "{schema}"."{prefix}__events"
+        WHERE ts IN (
+            SELECT ts
+            FROM "{schema}"."{prefix}__events"
+            ORDER BY ts ASC
+            LIMIT 100
+        )
+        RETURNING ts, payload
+    )
+    SELECT payload FROM popped ORDER BY ts ASC;
 """
 
 
@@ -64,5 +76,3 @@ CREATE_TRIGGER = """
     ON "{schema}"."{table}" FOR EACH ROW
     EXECUTE PROCEDURE "{schema}"."{prefix}__emit_event"();
 """
-
-

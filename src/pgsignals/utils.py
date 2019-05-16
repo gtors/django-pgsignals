@@ -49,7 +49,7 @@ def listen(
     :param poll_timeout: Max wait timeout for polling (in seconds)
     :param listen_timeout: Max listen timeout (in seconds)
     :param events_limit: Max events count to listen
-    :param once: Handle only first batch of events 
+    :param once: Handle only first batch of events
     """
     notifies = iter_notifies(
         db=db,
@@ -83,19 +83,31 @@ def iter_notifies(
     started_at = time.time()
 
     with connections[db].cursor() as cursor:
-
-        # Iterator for extracting events from staging table
-        def _iter_events():
-            cursor.execute(POP_EVENT.format(
+        def _count_events():
+            cursor.execute(COUNT_EVENTS.format(
                 schema=schema,
                 prefix=PREFIX
             ))
+            return cursor.fetchone()[0]
 
-            for (notify,) in cursor:
-                event = _notify_to_event(notify)
-                if event is not None:
-                    yield event
-        
+        # Iterator for extracting events from staging table
+        def _iter_events():
+            count = _count_events()
+
+            while count != 0:
+                cursor.execute(POP_100_EVENTS.format(
+                    schema=schema,
+                    prefix=PREFIX
+                ))
+
+                for (notify,) in cursor:
+                    event = _notify_to_event(notify)
+                    if event is not None:
+                        yield event
+
+                count = _count_events()
+
+
         # Emit previously unhandled events
         for event in _iter_events():
             yield event
@@ -108,14 +120,14 @@ def iter_notifies(
             # Check iteration break timeout
             if iter_timeout and (time.time() - started_at) >= iter_timeout:
                 break
-            
+
             # Poll for any new notifies
             if any(select.select([conn],[],[], poll_timeout)):
                 conn.poll()
 
                 if len(conn.notifies) > 0:
                     conn.notifies.clear()
-                    
+
                     # Emit new events
                     for event in _iter_events():
                         yield event
@@ -245,7 +257,7 @@ __migrated: bool = False
 def migrate_pgsignals_once(
         db: str = DEFAULT_DATABASE,
         schema: str = DEFAULT_SCHEMA) -> None:
-    
+
     global __migrated
 
     if not __migrated:
