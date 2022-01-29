@@ -1,5 +1,6 @@
 import functools
 import itertools
+import json
 import logging
 import select
 import time
@@ -101,6 +102,8 @@ def iter_notifies(
                 ))
 
                 for (notify,) in cursor:
+                    if issubclass(type(notify), str):
+                        notify = json.loads(notify, strict=False)
                     event = _notify_to_event(notify)
                     if event is not None:
                         yield event
